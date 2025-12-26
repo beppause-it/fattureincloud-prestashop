@@ -32,7 +32,7 @@ class fattureincloud extends Module
         $this->name = 'fattureincloud';
         $this->tab = 'billing_invoicing';
         $this->version = '2.3.0';
-        $this->author = 'FattureInCloud';
+        $this->author = 'beppause-it (fork of FattureInCloud)';
         $this->need_instance = 1;
 
         $this->bootstrap = true;
@@ -116,6 +116,27 @@ class fattureincloud extends Module
         }
         
         return true;
+    }
+    
+    /**
+    * Disable module - Delete authentication parameters only
+    */
+    public function disable($force_all = false)
+    {
+        // Delete only authentication parameters
+        $auth_keys = [
+            'FATTUREINCLOUD_ACCESS_TOKEN',
+            'FATTUREINCLOUD_REFRESH_TOKEN',
+            'FATTUREINCLOUD_DEVICE_CODE',
+            'FATTUREINCLOUD_COMPANY_ID',
+        ];
+        
+        foreach ($auth_keys as $key) {
+            Configuration::deleteByName($key);
+        }
+        
+        // Call parent disable method
+        return parent::disable($force_all);
     }
     
     /**
