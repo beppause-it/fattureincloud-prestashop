@@ -12,7 +12,9 @@ class FattureInCloudClient
     private $apiBaseUrl = "https://api-v2.fattureincloud.it";
     private $userAgent;
     private $clientId = "NTRjNjY0MjU1YzBiODFhYmI4MDc0NGFm";
-    private $scope = "entity.clients:a issued_documents.orders:a issued_documents.invoices:a settings:a products:a";
+    // NOTE: updating this scope requires the merchant to re-authorize the module (new device code flow)
+    // to grant the additional permissions.
+    private $scope = "entity.clients:a issued_documents.orders:a issued_documents.invoices:a receipts:a settings:a products:a";
     private $redirectUri = "https://fattureincloud.it/connetti";
     private $maxRetry = 2;
     
@@ -197,6 +199,24 @@ class FattureInCloudClient
         $return = $this->makeCompanyRequest("issued_documents/". $invoiceId . '/e_invoice/send', null, "POST");
         
         return $return;
+    }
+
+    /**
+     * Receipts (corrispettivi)
+     */
+    public function getReceiptDetails($receiptId, $params = null)
+    {
+        return $this->makeCompanyRequest("receipts/" . $receiptId, $params);
+    }
+
+    public function createReceipt($data)
+    {
+        return $this->makeCompanyRequest("receipts", $data, "POST");
+    }
+
+    public function modifyReceipt($receiptId, $data)
+    {
+        return $this->makeCompanyRequest("receipts/" . $receiptId, $data, "PUT");
     }
     
     private function makeOAuthRequest($endpoint, $body = null)

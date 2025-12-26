@@ -20,6 +20,9 @@ require_once dirname(__FILE__).'/libs/fattureincloudClient.php';
 class fattureincloud extends Module
 {
     protected $config_form = false;
+
+    // FattureInCloud receipt type value (API v2)
+    const FIC_RECEIPT_TYPE_SALES_RECEIPT = 'sales_receipt';
     
     /**
     * Initial configuration
@@ -28,7 +31,7 @@ class fattureincloud extends Module
     {
         $this->name = 'fattureincloud';
         $this->tab = 'billing_invoicing';
-        $this->version = '2.2.1';
+        $this->version = '2.3.0';
         $this->author = 'FattureInCloud';
         $this->need_instance = 1;
 
@@ -54,6 +57,10 @@ class fattureincloud extends Module
         if (!parent::install()) {
             return false;
         }
+
+        // Default configuration for receipts (corrispettivi)
+        Configuration::updateValue('FATTUREINCLOUD_RECEIPTS_CREATE', 0);
+        Configuration::updateValue('FATTUREINCLOUD_RECEIPTS_NUMERATION', 'REC-PS');
         
         $this->installTab();
         
@@ -100,6 +107,8 @@ class fattureincloud extends Module
             !Configuration::updateValue('FATTUREINCLOUD_INVOICES_CREATE', 0)||
             !Configuration::updateValue('FATTUREINCLOUD_INVOICES_SEND_TO_SDI', 0)||
             !Configuration::updateValue('FATTUREINCLOUD_INVOICES_SUFFIX', '')||
+            !Configuration::updateValue('FATTUREINCLOUD_RECEIPTS_CREATE', 0)||
+            !Configuration::updateValue('FATTUREINCLOUD_RECEIPTS_NUMERATION', 'REC-PS')||
             !Configuration::updateValue('FATTUREINCLOUD_CUSTOMERS_UPDATE', 0)||
             !Configuration::updateValue('FATTUREINCLOUD_RC_CENTER', '')
         ) {
@@ -280,7 +289,7 @@ class fattureincloud extends Module
             'label' => 'Crea fatture',
             'name' => 'FATTUREINCLOUD_INVOICES_CREATE',
             'is_bool' => true,
-            'desc' => 'Quando un ordine viene pagato verrà creata una fattura su FattureInCloud. Se disattivato Prestashop utilizzerà le funzionalità di fatturazione standard.',
+            'desc' => 'Quando un ordine viene pagato verrà creata una fattura su FattureInCloud. Se disattivato Prestashop utilizzerà le funzionalità di fatturazione standard. Se attivi anche i corrispettivi, verrà creata la fattura solo se è presente una P.IVA nell\'indirizzo di fatturazione, altrimenti verrà creato un corrispettivo.',
             'values' => array(
                 array(
                     'id' => 'active_on',
@@ -321,6 +330,35 @@ class fattureincloud extends Module
             'desc' => 'Il sezionale che verrà aggiunto in automatico alla numerazione delle fatture',
             'name' => 'FATTUREINCLOUD_INVOICES_SUFFIX',
             'label' => 'Sezionale fatture',
+            'required' => false,
+        );
+
+        $form_fields[] = array(
+            'type' => 'switch',
+            'label' => 'Crea corrispettivi',
+            'name' => 'FATTUREINCLOUD_RECEIPTS_CREATE',
+            'is_bool' => true,
+            'desc' => 'Quando un ordine viene pagato verrà creato un corrispettivo (scontrino) su FattureInCloud. Se attivi anche le fatture, verrà creata la fattura solo se è presente una P.IVA nell\'indirizzo di fatturazione, altrimenti verrà creato un corrispettivo.',
+            'values' => array(
+                array(
+                    'id' => 'active_on',
+                    'value' => true,
+                    'label' => 'Attivato'
+                ),
+                array(
+                    'id' => 'active_off',
+                    'value' => false,
+                    'label' => 'Disattivato'
+                ),
+            ),
+        );
+
+        $form_fields[] = array(
+            'col' => 3,
+            'type' => 'text',
+            'desc' => 'La numerazione (sezionale) utilizzata per i corrispettivi su FattureInCloud, ad esempio REC-PS',
+            'name' => 'FATTUREINCLOUD_RECEIPTS_NUMERATION',
+            'label' => 'Numerazione corrispettivi',
             'required' => false,
         );
                         
@@ -372,6 +410,8 @@ class fattureincloud extends Module
             'FATTUREINCLOUD_INVOICES_CREATE' => Configuration::get('FATTUREINCLOUD_INVOICES_CREATE'),
             'FATTUREINCLOUD_INVOICES_SEND_TO_SDI' => Configuration::get('FATTUREINCLOUD_INVOICES_SEND_TO_SDI'),
             'FATTUREINCLOUD_INVOICES_SUFFIX' => Configuration::get('FATTUREINCLOUD_INVOICES_SUFFIX'),
+            'FATTUREINCLOUD_RECEIPTS_CREATE' => Configuration::get('FATTUREINCLOUD_RECEIPTS_CREATE'),
+            'FATTUREINCLOUD_RECEIPTS_NUMERATION' => Configuration::get('FATTUREINCLOUD_RECEIPTS_NUMERATION'),
             'FATTUREINCLOUD_CUSTOMERS_UPDATE' => Configuration::get('FATTUREINCLOUD_CUSTOMERS_UPDATE'),
             'FATTUREINCLOUD_RC_CENTER' => Configuration::get('FATTUREINCLOUD_RC_CENTER'),
         );
@@ -779,11 +819,42 @@ class fattureincloud extends Module
         $order_id = $order['id_order'];
         $order_complete = new Order($order_id);
         
-        if (Configuration::get('FATTUREINCLOUD_INVOICES_CREATE')
-            && $order_status->paid == true
+        $is_paid_status = ($order_status->paid == true
             && ($order_complete->current_state == Configuration::get('PS_OS_PAYMENT')
                 || $order_complete->current_state == Configuration::get('PS_OS_WS_PAYMENT'))
-            ) {
+        );
+
+        if (!$is_paid_status) {
+            return;
+        }
+
+        $invoices_enabled = (bool) Configuration::get('FATTUREINCLOUD_INVOICES_CREATE');
+        $receipts_enabled = (bool) Configuration::get('FATTUREINCLOUD_RECEIPTS_CREATE');
+
+        if (!$invoices_enabled && !$receipts_enabled) {
+            return;
+        }
+
+        // Hybrid rule: if both enabled -> invoice only when VAT number is present, otherwise receipt
+        $should_create_invoice = false;
+        $should_create_receipt = false;
+
+        if ($invoices_enabled && $receipts_enabled) {
+            $billing_address = new Address((int) $order_complete->id_address_invoice);
+            $has_vat_number = (!empty($billing_address->vat_number) && trim($billing_address->vat_number) != '');
+
+            if ($has_vat_number) {
+                $should_create_invoice = true;
+            } else {
+                $should_create_receipt = true;
+            }
+        } elseif ($invoices_enabled) {
+            $should_create_invoice = true;
+        } elseif ($receipts_enabled) {
+            $should_create_receipt = true;
+        }
+
+        if ($should_create_invoice) {
             $this->writeLog("INFO - Creazione Fattura: " . $order_id);
             
             $create_invoice = true;
@@ -821,16 +892,28 @@ class fattureincloud extends Module
                     
                     $number_to_save .= "/" . $create_invoice_request['data']['year'];
                     
-                    $query = 'INSERT INTO `'._DB_PREFIX_.'fattureInCloud`
-                        (`ps_order_id`,`fic_invoice_id`,`fic_invoice_number`,`fic_invoice_download_token`,`fic_invoice_download_url`)
-                        VALUES (
-                        '.$order_id.',
-                        '.$create_invoice_request['data']['id'].',
-                        "'.$number_to_save.'",
-                        "'.$create_invoice_request['data']['permanent_token'].'",
-                        "'.$create_invoice_request['data']['url'].'"
-                    );';
-                    
+                    // Update existing row for this order if present, otherwise insert
+                    $sql_row_check = 'SELECT id_fattureInCloud FROM `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.';';
+                    $row_check = Db::getInstance()->getRow($sql_row_check);
+                    if (!empty($row_check['id_fattureInCloud'])) {
+                        $query = 'UPDATE `'._DB_PREFIX_.'fattureInCloud` SET '
+                            .' `fic_invoice_id` = '.$create_invoice_request['data']['id'].','
+                            .' `fic_invoice_number` = "'.$number_to_save.'",'
+                            .' `fic_invoice_download_token` = "'.$create_invoice_request['data']['permanent_token'].'",'
+                            .' `fic_invoice_download_url` = "'.$create_invoice_request['data']['url'].'"'
+                            .' WHERE `ps_order_id` = '.$order_id.';';
+                    } else {
+                        $query = 'INSERT INTO `'._DB_PREFIX_.'fattureInCloud`
+                            (`ps_order_id`,`fic_invoice_id`,`fic_invoice_number`,`fic_invoice_download_token`,`fic_invoice_download_url`)
+                            VALUES (
+                            '.$order_id.',
+                            '.$create_invoice_request['data']['id'].',
+                            "'.$number_to_save.'",
+                            "'.$create_invoice_request['data']['permanent_token'].'",
+                            "'.$create_invoice_request['data']['url'].'"
+                        );';
+                    }
+
                     Db::getInstance()->execute($query);
                         
                     $this->writeLog("INFO - Fattura creata: #" . $number_to_save);
@@ -855,7 +938,247 @@ class fattureincloud extends Module
                 $this->writeLog("INFO - Creazione fattura interrotta: Già esiste una fattura per questo ordine: " . json_encode($get_document_detail_request));
                 
             }
+
+            return;
         }
+
+        if ($should_create_receipt) {
+            $this->writeLog("INFO - Creazione Corrispettivo: " . $order_id);
+
+            $fic_client = $this->initFattureInCloudClient();
+
+            // Check if receipt already exists
+            $sql_receipt_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_receipt_id IS NOT NULL';
+
+            if ($row_receipt_check = Db::getInstance()->getRow($sql_receipt_check)) {
+                $get_receipt_detail_request = $fic_client->getReceiptDetails($row_receipt_check['fic_receipt_id']);
+
+                if (isset($get_receipt_detail_request['error'])) {
+                    $sql_receipt_delete = 'DELETE FROM `'._DB_PREFIX_.'fattureInCloud` WHERE id_fattureInCloud = '.$row_receipt_check['id_fattureInCloud'].';';
+                    Db::getInstance()->execute($sql_receipt_delete);
+                } else {
+                    $this->writeLog("INFO - Creazione corrispettivo interrotta: Già esiste un corrispettivo per questo ordine: " . json_encode($get_receipt_detail_request));
+                    return;
+                }
+            }
+
+            $receipt_to_create = $this->composeReceipt($order_id);
+            $create_receipt_request = $fic_client->createReceipt($receipt_to_create);
+
+            if (!$create_receipt_request || isset($create_receipt_request['error'])) {
+                $this->writeLog("ERROR - Corrispettivo non creato: " . json_encode($create_receipt_request) . " - " . $fic_client->toJson() . " - " . json_encode($receipt_to_create));
+                return;
+            }
+
+            $number_to_save = $create_receipt_request['data']['number'];
+            if (isset($create_receipt_request['data']['numeration']) && $create_receipt_request['data']['numeration'] != "") {
+                $number_to_save .= $create_receipt_request['data']['numeration'];
+            }
+
+            if (isset($create_receipt_request['data']['year'])) {
+                $number_to_save .= "/" . $create_receipt_request['data']['year'];
+            }
+
+            $receipt_url = null;
+            $receipt_token = null;
+            if (isset($create_receipt_request['data']['url'])) {
+                $receipt_url = $create_receipt_request['data']['url'];
+            }
+            if (isset($create_receipt_request['data']['permanent_token'])) {
+                $receipt_token = $create_receipt_request['data']['permanent_token'];
+            }
+
+            // Update existing row for this order if present, otherwise insert
+            $sql_row_check = 'SELECT id_fattureInCloud FROM `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.';';
+            $row_check = Db::getInstance()->getRow($sql_row_check);
+            if (!empty($row_check['id_fattureInCloud'])) {
+                $query = 'UPDATE `'._DB_PREFIX_.'fattureInCloud` SET '
+                    .' `fic_receipt_id` = '.$create_receipt_request['data']['id'].','
+                    .' `fic_receipt_number` = "'.$number_to_save.'",'
+                    .' `fic_receipt_download_token` = "'.$receipt_token.'",'
+                    .' `fic_receipt_download_url` = "'.$receipt_url.'"'
+                    .' WHERE `ps_order_id` = '.$order_id.';';
+            } else {
+                $query = 'INSERT INTO `'._DB_PREFIX_.'fattureInCloud`
+                    (`ps_order_id`,`fic_receipt_id`,`fic_receipt_number`,`fic_receipt_download_token`,`fic_receipt_download_url`)
+                    VALUES (
+                    '.$order_id.',
+                    '.$create_receipt_request['data']['id'].',
+                    "'.$number_to_save.'",
+                    "'.$receipt_token.'",
+                    "'.$receipt_url.'"
+                );';
+            }
+
+            Db::getInstance()->execute($query);
+            $this->writeLog("INFO - Corrispettivo creato: #" . $number_to_save);
+        }
+    }
+
+    /**
+     * Prepare receipt for creation
+     */
+    public function composeReceipt($order_id)
+    {
+        return $this->mapPrestashopToFicReceipt($order_id);
+    }
+
+    /**
+     * Determine receipt date for an order
+     */
+    public function getOrderPaidDate($order_id)
+    {
+        $order = new Order((int) $order_id);
+
+        // 1) order_payment table: take the first recorded payment (works even without invoices)
+        if (!empty($order->reference)) {
+            $sql = 'SELECT op.`date_add` FROM `'. _DB_PREFIX_.'order_payment` op'
+                .' WHERE op.`order_reference` = "'.pSQL($order->reference).'"'
+                .' ORDER BY op.`date_add` ASC';
+
+            $row = Db::getInstance(_PS_USE_SQL_SLAVE_)->getRow($sql);
+            if (!empty($row['date_add'])) {
+                return $row['date_add'];
+            }
+        }
+
+        // 2) fallback: order invoice date (may be empty)
+        $order = new Order((int) $order_id);
+        if (!empty($order->invoice_date) && $order->invoice_date != '0000-00-00 00:00:00') {
+            return $order->invoice_date;
+        }
+
+        // 3) fallback: order creation date
+        return $order->date_add;
+    }
+
+    /**
+     * Get next receipt number for a given date (annual progression)
+     */
+    public function getNextReceiptNumber($date_time)
+    {
+        $year = (int) date('Y', strtotime($date_time));
+
+        $sql = 'SELECT fic_receipt_number FROM `'. _DB_PREFIX_.'fattureInCloud`'
+            .' WHERE fic_receipt_number IS NOT NULL AND fic_receipt_number != ""'
+            .' ORDER BY id_fattureInCloud DESC';
+
+        $rows = Db::getInstance(_PS_USE_SQL_SLAVE_)->executeS($sql);
+
+        $last_number = 0;
+        foreach ($rows as $row) {
+            // expected format: <number><numeration>/<year>
+            if (preg_match('/^(\d+).*\/(\d{4})$/', $row['fic_receipt_number'], $m)) {
+                if ((int)$m[2] === $year) {
+                    $last_number = (int) $m[1];
+                    break;
+                }
+            }
+        }
+
+        return $last_number + 1;
+    }
+
+    /**
+     * Map Prestashop order to FattureInCloud Receipt (corrispettivo)
+     */
+    public function mapPrestashopToFicReceipt($order_id)
+    {
+        $order = new Order((int) $order_id);
+
+        $paid_date = $this->getOrderPaidDate($order_id);
+        $receipt_date = date('Y-m-d', strtotime($paid_date));
+
+        $numeration = Configuration::get('FATTUREINCLOUD_RECEIPTS_NUMERATION');
+        if (empty($numeration)) {
+            $numeration = 'REC-PS';
+        }
+
+        $number = $this->getNextReceiptNumber($paid_date);
+
+        // Items: group gross amounts by fic vat id
+        $vat_groups = array();
+        $products = $order->getProducts();
+        $fic_no_vat_id = $this->getDefaultVatID(0, null);
+
+        foreach ($products as $product) {
+            $gross_line_total = (float) $product['total_price_tax_incl'];
+
+            $vat_id = $fic_no_vat_id;
+            if (!empty($product['tax_calculator']->taxes[0])) {
+                $ps_vat_id = $product['tax_calculator']->taxes[0]->id;
+                $vat_id = $this->getVatID($ps_vat_id);
+            }
+
+            if (!isset($vat_groups[$vat_id])) {
+                $vat_groups[$vat_id] = 0;
+            }
+            $vat_groups[$vat_id] += $gross_line_total;
+        }
+
+        // Shipping and wrapping grouped by their VAT
+        $billing_address = new Address((int) $order->id_address_invoice);
+        $shipping_address = $billing_address;
+        if ($order->id_address_delivery) {
+            $shipping_address = new Address((int) $order->id_address_delivery);
+        }
+
+        $carrier = new Carrier($order->id_carrier);
+        $fic_carrier_vat_id = $fic_no_vat_id;
+        if (!empty($carrier->getTaxCalculator($shipping_address)->taxes[0])) {
+            $carrier_vat_id = $carrier->getTaxCalculator($shipping_address)->taxes[0]->id;
+            $fic_carrier_vat_id = $this->getVatID($carrier_vat_id);
+        }
+
+        if ((float)$order->total_shipping_tax_incl > 0) {
+            if (!isset($vat_groups[$fic_carrier_vat_id])) {
+                $vat_groups[$fic_carrier_vat_id] = 0;
+            }
+            $vat_groups[$fic_carrier_vat_id] += (float) $order->total_shipping_tax_incl;
+        }
+
+        if ((float)$order->total_wrapping_tax_incl > 0) {
+            if (!isset($vat_groups[$fic_carrier_vat_id])) {
+                $vat_groups[$fic_carrier_vat_id] = 0;
+            }
+            $vat_groups[$fic_carrier_vat_id] += (float) $order->total_wrapping_tax_incl;
+        }
+
+        // Build items_list
+        $items_list = array();
+        foreach ($vat_groups as $vat_id => $amount_gross) {
+            // skip zero
+            if (abs((float)$amount_gross) < 0.00001) {
+                continue;
+            }
+
+            $items_list[] = array(
+                'amount_gross' => (float) number_format((float)$amount_gross, 2, '.', ''),
+                'vat' => array('id' => (int)$vat_id),
+            );
+        }
+
+        // Payment account
+        $payment_account_id = $this->getPaymentAccountIDByName($order->payment);
+
+        $receipt = array(
+            'data' => array(
+                'type' => self::FIC_RECEIPT_TYPE_SALES_RECEIPT,
+                'numeration' => $numeration,
+                'date' => $receipt_date,
+                'number' => $number,
+                'description' => 'Corrispettivo ordine #' . $order->reference,
+                'amount_gross' => (float) number_format((float)$order->total_paid_tax_incl, 2, '.', ''),
+                'use_gross_prices' => true,
+                'items_list' => $items_list,
+            )
+        );
+
+        if (!empty($payment_account_id)) {
+            $receipt['data']['payment_account'] = array('id' => (int)$payment_account_id);
+        }
+
+        return $receipt;
     }
     
     /**

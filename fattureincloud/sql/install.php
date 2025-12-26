@@ -14,12 +14,16 @@ $sql_create_main_table = 'CREATE TABLE IF NOT EXISTS `'._DB_PREFIX_.'fattureInCl
     `ps_order_id` int(11),
     `fic_order_id` bigint(20),
     `fic_invoice_id` bigint(20),
+    `fic_receipt_id` bigint(20),
     `fic_order_download_token` varchar(255),
     `fic_invoice_download_token` varchar(255),
+    `fic_receipt_download_token` varchar(255),
     `fic_order_download_url` varchar(255),
     `fic_invoice_download_url` varchar(255),
+    `fic_receipt_download_url` varchar(255),
     `fic_order_number` varchar(255),
     `fic_invoice_number` varchar(255),
+    `fic_receipt_number` varchar(255),
     PRIMARY KEY  (`id_fattureInCloud`)
 ) ENGINE='._MYSQL_ENGINE_.' DEFAULT CHARSET=utf8;';
 
@@ -44,6 +48,17 @@ try {
         ADD `fic_order_download_url` varchar(255),
         ADD `fic_invoice_download_url` varchar(255)';
     Db::getInstance()->execute($sql_new_fields);
+} catch (Exception $e) {
+}
+
+// Add receipt fields to fattureInCloud table (for updates from old plugin versions)
+try {
+    $sql_new_receipt_fields =  'ALTER TABLE `'. _DB_PREFIX_.'fattureInCloud`
+        ADD `fic_receipt_id` bigint(20),
+        ADD `fic_receipt_download_token` varchar(255),
+        ADD `fic_receipt_download_url` varchar(255),
+        ADD `fic_receipt_number` varchar(255)';
+    Db::getInstance()->execute($sql_new_receipt_fields);
 } catch (Exception $e) {
 }
     
