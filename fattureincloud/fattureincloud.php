@@ -832,7 +832,11 @@ class fattureincloud extends Module
      */
     public function hookActionOrderStatusPostUpdate($order)
     {
+        $this->writeLog("DEBUG - hookActionOrderStatusPostUpdate STARTED");
+        $this->writeLog("DEBUG - Module active: " . ($this->active ? "YES" : "NO"));
+        
         if (!$this->active) {
+            $this->writeLog("DEBUG - Module not active, exiting");
             return;
         }
         
@@ -840,19 +844,33 @@ class fattureincloud extends Module
         $order_id = $order['id_order'];
         $order_complete = new Order($order_id);
         
+        $this->writeLog("DEBUG - Order ID: " . $order_id);
+        $this->writeLog("DEBUG - Order status ID: " . $order_status->id);
+        $this->writeLog("DEBUG - Order status paid: " . ($order_status->paid ? "YES" : "NO"));
+        $this->writeLog("DEBUG - Order current state: " . $order_complete->current_state);
+        $this->writeLog("DEBUG - PS_OS_PAYMENT: " . Configuration::get('PS_OS_PAYMENT'));
+        $this->writeLog("DEBUG - PS_OS_WS_PAYMENT: " . Configuration::get('PS_OS_WS_PAYMENT'));
+        
         $is_paid_status = ($order_status->paid == true
             && ($order_complete->current_state == Configuration::get('PS_OS_PAYMENT')
                 || $order_complete->current_state == Configuration::get('PS_OS_WS_PAYMENT'))
         );
 
+        $this->writeLog("DEBUG - Is paid status: " . ($is_paid_status ? "YES" : "NO"));
+
         if (!$is_paid_status) {
+            $this->writeLog("DEBUG - Not a paid status, exiting");
             return;
         }
 
         $invoices_enabled = (bool) Configuration::get('FATTUREINCLOUD_INVOICES_CREATE');
         $receipts_enabled = (bool) Configuration::get('FATTUREINCLOUD_RECEIPTS_CREATE');
 
+        $this->writeLog("DEBUG - Invoices enabled: " . ($invoices_enabled ? "YES" : "NO"));
+        $this->writeLog("DEBUG - Receipts enabled: " . ($receipts_enabled ? "YES" : "NO"));
+
         if (!$invoices_enabled && !$receipts_enabled) {
+            $this->writeLog("DEBUG - Neither invoices nor receipts enabled, exiting");
             return;
         }
 
@@ -863,16 +881,24 @@ class fattureincloud extends Module
         if ($invoices_enabled && $receipts_enabled) {
             $billing_address = new Address((int) $order_complete->id_address_invoice);
             $has_vat_number = (!empty($billing_address->vat_number) && trim($billing_address->vat_number) != '');
+            
+            $this->writeLog("DEBUG - Hybrid mode: checking VAT number");
+            $this->writeLog("DEBUG - Billing address VAT number: '" . $billing_address->vat_number . "'");
+            $this->writeLog("DEBUG - Has VAT number: " . ($has_vat_number ? "YES" : "NO"));
 
             if ($has_vat_number) {
                 $should_create_invoice = true;
+                $this->writeLog("DEBUG - Will create INVOICE (customer has VAT number)");
             } else {
                 $should_create_receipt = true;
+                $this->writeLog("DEBUG - Will create RECEIPT (customer has NO VAT number)");
             }
         } elseif ($invoices_enabled) {
             $should_create_invoice = true;
+            $this->writeLog("DEBUG - Will create INVOICE (only invoices enabled)");
         } elseif ($receipts_enabled) {
             $should_create_receipt = true;
+            $this->writeLog("DEBUG - Will create RECEIPT (only receipts enabled)");
         }
 
         if ($should_create_invoice) {
@@ -984,12 +1010,19 @@ class fattureincloud extends Module
             }
 
             $receipt_to_create = $this->composeReceipt($order_id);
+            
+            // DEBUG: Log della struttura del corrispettivo
+            $this->writeLog("DEBUG - Struttura corrispettivo: " . json_encode($receipt_to_create));
+            
             $create_receipt_request = $fic_client->createReceipt($receipt_to_create);
 
             if (!$create_receipt_request || isset($create_receipt_request['error'])) {
                 $this->writeLog("ERROR - Corrispettivo non creato: " . json_encode($create_receipt_request) . " - " . $fic_client->toJson() . " - " . json_encode($receipt_to_create));
                 return;
             }
+            
+            // DEBUG: Log della risposta
+            $this->writeLog("DEBUG - Risposta creazione corrispettivo: " . json_encode($create_receipt_request));
 
             $number_to_save = $create_receipt_request['data']['number'];
             if (isset($create_receipt_request['data']['numeration']) && $create_receipt_request['data']['numeration'] != "") {
@@ -1115,7 +1148,12 @@ class fattureincloud extends Module
             $numeration = 'REC-PS';
         }
 
-        $number = $this->getNextReceiptNumber($paid_date);
+        // Opzione 1: Lasciare che FattureInCloud assegni il numero
+        // $number = $this->getNextReceiptNumber($paid_date);
+        $number = null;  // Ometti completamente il campo
+        
+        // Opzione 2: Mantenere il calcolo locale (attuale)
+        //$number = $this->getNextReceiptNumber($paid_date);
 
         // Items: group gross amounts by fic vat id
         $vat_groups = array();
@@ -1182,13 +1220,24 @@ class fattureincloud extends Module
         // Payment account
         $payment_account_id = $this->getPaymentAccountIDByName($order->payment);
 
+        // Get customer name for receipt description
+        $customer = new Customer((int)$order->id_customer);
+        $billing_address = new Address((int)$order->id_address_invoice);
+        
+        $customer_name = '';
+        if ($billing_address->company && trim($billing_address->company) != "") {
+            $customer_name = $billing_address->company;
+        } else {
+            $customer_name = $customer->firstname . ' ' . $customer->lastname;
+        }
+        
         $receipt = array(
             'data' => array(
                 'type' => self::FIC_RECEIPT_TYPE_SALES_RECEIPT,
                 'numeration' => $numeration,
                 'date' => $receipt_date,
-                'number' => $number,
-                'description' => 'Corrispettivo ordine #' . $order->reference,
+                //'number' => $number,
+                'description' => 'Corrispettivo ordine #' . $order->reference . ' - Cliente: ' . $customer_name,
                 'amount_gross' => (float) number_format((float)$order->total_paid_tax_incl, 2, '.', ''),
                 'use_gross_prices' => true,
                 'items_list' => $items_list,
