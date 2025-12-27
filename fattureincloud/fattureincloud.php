@@ -1237,7 +1237,7 @@ class fattureincloud extends Module
                 'numeration' => $numeration,
                 'date' => $receipt_date,
                 //'number' => $number,
-                'description' => 'Corrispettivo ordine #' . $order->reference . ' - Cliente: ' . $customer_name,
+                'description' => $customer_name,
                 'amount_gross' => (float) number_format((float)$order->total_paid_tax_incl, 2, '.', ''),
                 'use_gross_prices' => true,
                 'items_list' => $items_list,
