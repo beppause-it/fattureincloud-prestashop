@@ -850,16 +850,23 @@ class fattureincloud extends Module
         $this->writeLog("DEBUG - Order current state: " . $order_complete->current_state);
         $this->writeLog("DEBUG - PS_OS_PAYMENT: " . Configuration::get('PS_OS_PAYMENT'));
         $this->writeLog("DEBUG - PS_OS_WS_PAYMENT: " . Configuration::get('PS_OS_WS_PAYMENT'));
+        $this->writeLog("DEBUG - PS_OS_SHIPPING: " . Configuration::get('PS_OS_SHIPPING'));
         
+        // Check if status is paid (for invoices)
         $is_paid_status = ($order_status->paid == true
             && ($order_complete->current_state == Configuration::get('PS_OS_PAYMENT')
                 || $order_complete->current_state == Configuration::get('PS_OS_WS_PAYMENT'))
         );
+        
+        // Check if status is shipped (for receipts)
+        $is_shipped_status = ($order_complete->current_state == Configuration::get('PS_OS_SHIPPING'));
 
         $this->writeLog("DEBUG - Is paid status: " . ($is_paid_status ? "YES" : "NO"));
+        $this->writeLog("DEBUG - Is shipped status: " . ($is_shipped_status ? "YES" : "NO"));
 
-        if (!$is_paid_status) {
-            $this->writeLog("DEBUG - Not a paid status, exiting");
+        // If neither paid nor shipped, exit
+        if (!$is_paid_status && !$is_shipped_status) {
+            $this->writeLog("DEBUG - Not a paid or shipped status, exiting");
             return;
         }
 
@@ -908,7 +915,7 @@ class fattureincloud extends Module
             
             $fic_client = $this->initFattureInCloudClient();
             
-            // Check if document already exists
+            // Check if invoice already exists
             $sql_invoice_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_invoice_id IS NOT NULL';
         
             if ($row_invoice_check = Db::getInstance()->getRow($sql_invoice_check)) {
@@ -920,6 +927,13 @@ class fattureincloud extends Module
                 } else {
                     $create_invoice = false;
                 }
+            }
+            
+            // Also check if receipt exists - if receipt exists, don't create invoice
+            $sql_receipt_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_receipt_id IS NOT NULL';
+            if ($row_receipt_check = Db::getInstance()->getRow($sql_receipt_check)) {
+                $this->writeLog("INFO - Non creo fattura perché esiste già un corrispettivo per questo ordine");
+                $create_invoice = false;
             }
             
             if ($create_invoice) {
@@ -1007,6 +1021,13 @@ class fattureincloud extends Module
                     $this->writeLog("INFO - Creazione corrispettivo interrotta: Già esiste un corrispettivo per questo ordine: " . json_encode($get_receipt_detail_request));
                     return;
                 }
+            }
+            
+            // Also check if invoice exists - if invoice exists, don't create receipt
+            $sql_invoice_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_invoice_id IS NOT NULL';
+            if ($row_invoice_check = Db::getInstance()->getRow($sql_invoice_check)) {
+                $this->writeLog("INFO - Non creo corrispettivo perché esiste già una fattura per questo ordine");
+                return;
             }
 
             $receipt_to_create = $this->composeReceipt($order_id);
@@ -1203,7 +1224,17 @@ class fattureincloud extends Module
             $vat_groups[$fic_carrier_vat_id] += (float) $order->total_wrapping_tax_incl;
         }
 
-        // Build items_list
+        // Calculate overall discount from coupons
+        $coupons = $order->getCartRules();
+        $overall_discount = 0;
+        $used_coupons = array();
+        
+        foreach ($coupons as $coupon) {
+            $used_coupons[] = $coupon['name'];
+            $overall_discount += $coupon['value'];
+        }
+
+        // Build items_list from vat_groups
         $items_list = array();
         foreach ($vat_groups as $vat_id => $amount_gross) {
             // skip zero
@@ -1214,6 +1245,15 @@ class fattureincloud extends Module
             $items_list[] = array(
                 'amount_gross' => (float) number_format((float)$amount_gross, 2, '.', ''),
                 'vat' => array('id' => (int)$vat_id),
+            );
+        }
+        
+        // Apply overall discount as a separate item with 0% VAT (id 6)
+        if ($overall_discount > 0) {
+            // Add discount as negative item
+            $items_list[] = array(
+                'amount_gross' => -(float) number_format((float)$overall_discount, 2, '.', ''),
+                'vat' => array('id' => 6), // 0% VAT
             );
         }
 
@@ -1231,13 +1271,16 @@ class fattureincloud extends Module
             $customer_name = $customer->firstname . ' ' . $customer->lastname;
         }
         
+        // Add order ID before customer name in description
+        $description = '' . $order->id . ' - ' . $customer_name;
+        
         $receipt = array(
             'data' => array(
                 'type' => self::FIC_RECEIPT_TYPE_SALES_RECEIPT,
                 'numeration' => $numeration,
                 'date' => $receipt_date,
                 //'number' => $number,
-                'description' => $customer_name,
+                'description' => $description,
                 'amount_gross' => (float) number_format((float)$order->total_paid_tax_incl, 2, '.', ''),
                 'use_gross_prices' => true,
                 'items_list' => $items_list,
