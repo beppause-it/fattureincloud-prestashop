@@ -852,21 +852,44 @@ class fattureincloud extends Module
         $this->writeLog("DEBUG - PS_OS_WS_PAYMENT: " . Configuration::get('PS_OS_WS_PAYMENT'));
         $this->writeLog("DEBUG - PS_OS_SHIPPING: " . Configuration::get('PS_OS_SHIPPING'));
         
-        // Check if status is paid (for invoices)
+        // Check if status is paid (for invoices and some receipts)
         $is_paid_status = ($order_status->paid == true
             && ($order_complete->current_state == Configuration::get('PS_OS_PAYMENT')
                 || $order_complete->current_state == Configuration::get('PS_OS_WS_PAYMENT'))
         );
         
-        // Check if status is shipped (for receipts)
+        // Check if status is shipped (for receipts with specific payment methods)
         $is_shipped_status = ($order_complete->current_state == Configuration::get('PS_OS_SHIPPING'));
 
         $this->writeLog("DEBUG - Is paid status: " . ($is_paid_status ? "YES" : "NO"));
         $this->writeLog("DEBUG - Is shipped status: " . ($is_shipped_status ? "YES" : "NO"));
 
+        // Determine payment method
+        $payment_method = strtolower($order_complete->payment);
+        $this->writeLog("DEBUG - Payment method: " . $payment_method);
+        
+        // Define which payment methods should create receipts on shipped status
+        $receipt_on_shipped_methods = array('bonifico', 'contrassegno', 'bankwire', 'cash on delivery', 'cod', 'bonifico bancario', 'pagamento in contrassegno');
+        $create_receipt_on_shipped = false;
+        
+        foreach ($receipt_on_shipped_methods as $method) {
+            if (strpos($payment_method, $method) !== false) {
+                $create_receipt_on_shipped = true;
+                break;
+            }
+        }
+        
+        $this->writeLog("DEBUG - Create receipt on shipped: " . ($create_receipt_on_shipped ? "YES" : "NO"));
+
         // If neither paid nor shipped, exit
         if (!$is_paid_status && !$is_shipped_status) {
             $this->writeLog("DEBUG - Not a paid or shipped status, exiting");
+            return;
+        }
+        
+        // If shipped status but payment method doesn't require receipt on shipped, exit
+        if ($is_shipped_status && !$create_receipt_on_shipped) {
+            $this->writeLog("DEBUG - Shipped status but payment method doesn't require receipt creation, exiting");
             return;
         }
 
