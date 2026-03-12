@@ -933,177 +933,217 @@ class fattureincloud extends Module
 
         if ($should_create_invoice) {
             $this->writeLog("INFO - Creazione Fattura: " . $order_id);
-            
-            $create_invoice = true;
+            $this->writeLog("DEBUG - Inizio transazione per fattura, ordine ID: " . $order_id);
             
             $fic_client = $this->initFattureInCloudClient();
             
-            // Check if invoice already exists
-            $sql_invoice_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_invoice_id IS NOT NULL';
-        
-            if (Db::getInstance()->getRow($sql_invoice_check)) {
-                $create_invoice = false;
-            }
+            // Inizia transazione atomica
+            Db::getInstance()->beginTransaction();
             
-            // Also check if receipt exists - if receipt exists, don't create invoice
-            $sql_receipt_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_receipt_id IS NOT NULL';
-            if (Db::getInstance()->getRow($sql_receipt_check)) {
-                $this->writeLog("INFO - Non creo fattura perché esiste già un corrispettivo per questo ordine");
-                $create_invoice = false;
-            }
-            
-            if ($create_invoice) {
-            
-                $invoice_to_create = $this->composeInvoice($order_id);
+            try {
+                $create_invoice = true;
                 
-                $create_invoice_request = $fic_client->createIssuedDocument($invoice_to_create);
-                if (!$create_invoice_request || isset($create_invoice_request['error'])) {
-                    $this->writeLog("ERROR - Fattura non creata: " . json_encode($create_invoice_request) . " - " . $fic_client->toJson() . " - " . json_encode($invoice_to_create));
-                } else {
-                    $number_to_save = $create_invoice_request['data']['number'];
-                    
-                    if ($create_invoice_request['data']['numeration'] != "") {
-                        $number_to_save .= $create_invoice_request['data']['numeration'];
-                    }
-                    
-                    $number_to_save .= "/" . $create_invoice_request['data']['year'];
-                    
-                    // Update existing row for this order if present, otherwise insert
-                    $sql_row_check = 'SELECT id_fattureInCloud FROM `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.';';
-                    $row_check = Db::getInstance()->getRow($sql_row_check);
-                    if (!empty($row_check['id_fattureInCloud'])) {
-                        $query = 'UPDATE `'._DB_PREFIX_.'fattureInCloud` SET '
-                            .' `fic_invoice_id` = '.$create_invoice_request['data']['id'].','
-                            .' `fic_invoice_number` = "'.$number_to_save.'",'
-                            .' `fic_invoice_download_token` = "'.$create_invoice_request['data']['permanent_token'].'",'
-                            .' `fic_invoice_download_url` = "'.$create_invoice_request['data']['url'].'"'
-                            .' WHERE `ps_order_id` = '.$order_id.';';
-                    } else {
-                        $query = 'INSERT INTO `'._DB_PREFIX_.'fattureInCloud`
-                            (`ps_order_id`,`fic_invoice_id`,`fic_invoice_number`,`fic_invoice_download_token`,`fic_invoice_download_url`)
-                            VALUES (
-                            '.$order_id.',
-                            '.$create_invoice_request['data']['id'].',
-                            "'.$number_to_save.'",
-                            "'.$create_invoice_request['data']['permanent_token'].'",
-                            "'.$create_invoice_request['data']['url'].'"
-                        );';
-                    }
-
-                    Db::getInstance()->execute($query);
-                        
-                    $this->writeLog("INFO - Fattura creata: #" . $number_to_save);
-                    
-                    if (Configuration::get('FATTUREINCLOUD_INVOICES_SEND_TO_SDI')) {
-                        $verify_einvoice_request = $fic_client->verifyEInvoiceXML($create_invoice_request['data']['id']);
-                        
-                        if (isset($verify_einvoice_request["error"])) {
-                            $this->writeLog("ERROR - Verifica XML fallita: " . json_encode($verify_einvoice_request));
-                        } else {
-                            $send_einvoice_request = $fic_client->sendEInvoice($create_invoice_request['data']['id']);
-                            
-                            if (isset($send_einvoice_request["error"])) {
-                                $this->writeLog("ERROR - Invio fattura elettronica fallito: " . json_encode($send_einvoice_request));
-                            }
-                        }
-                    }
+                // Check if invoice already exists (con lock per prevenire race conditions)
+                $sql_invoice_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_invoice_id IS NOT NULL FOR UPDATE';
+            
+                if (Db::getInstance()->getRow($sql_invoice_check)) {
+                    $create_invoice = false;
+                    $this->writeLog("DEBUG - Fattura già esistente per ordine ID: " . $order_id);
                 }
                 
-            } else {
+                // Also check if receipt exists - if receipt exists, don't create invoice
+                $sql_receipt_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_receipt_id IS NOT NULL';
+                if (Db::getInstance()->getRow($sql_receipt_check)) {
+                    $this->writeLog("INFO - Non creo fattura perché esiste già un corrispettivo per questo ordine");
+                    $create_invoice = false;
+                }
                 
-                $this->writeLog("INFO - Creazione fattura interrotta: Già esiste una fattura per questo ordine: " . json_encode($get_document_detail_request));
+                if ($create_invoice) {
+                    $this->writeLog("DEBUG - Nessuna fattura esistente, procedo con la creazione");
                 
-            }
+                    $invoice_to_create = $this->composeInvoice($order_id);
+                    
+                    $create_invoice_request = $fic_client->createIssuedDocument($invoice_to_create);
+                    if (!$create_invoice_request || isset($create_invoice_request['error'])) {
+                        $this->writeLog("ERROR - Fattura non creata: " . json_encode($create_invoice_request) . " - " . $fic_client->toJson() . " - " . json_encode($invoice_to_create));
+                        Db::getInstance()->rollback();
+                        $this->writeLog("DEBUG - Rollback transazione per errore creazione fattura");
+                        return;
+                    } else {
+                        $number_to_save = $create_invoice_request['data']['number'];
+                        
+                        if ($create_invoice_request['data']['numeration'] != "") {
+                            $number_to_save .= $create_invoice_request['data']['numeration'];
+                        }
+                        
+                        $number_to_save .= "/" . $create_invoice_request['data']['year'];
+                        
+                        // Update existing row for this order if present, otherwise insert
+                        $sql_row_check = 'SELECT id_fattureInCloud FROM `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' FOR UPDATE';
+                        $row_check = Db::getInstance()->getRow($sql_row_check);
+                        if (!empty($row_check['id_fattureInCloud'])) {
+                            $query = 'UPDATE `'._DB_PREFIX_.'fattureInCloud` SET '
+                                .' `fic_invoice_id` = '.$create_invoice_request['data']['id'].','
+                                .' `fic_invoice_number` = "'.$number_to_save.'",'
+                                .' `fic_invoice_download_token` = "'.$create_invoice_request['data']['permanent_token'].'",'
+                                .' `fic_invoice_download_url` = "'.$create_invoice_request['data']['url'].'"'
+                                .' WHERE `ps_order_id` = '.$order_id.';';
+                        } else {
+                            $query = 'INSERT INTO `'._DB_PREFIX_.'fattureInCloud`'
+                                .' (`ps_order_id`,`fic_invoice_id`,`fic_invoice_number`,`fic_invoice_download_token`,`fic_invoice_download_url`)'
+                                .' VALUES ('
+                                .$order_id.','
+                                .$create_invoice_request['data']['id'].','
+                                .'"'.$number_to_save.'",'
+                                .'"'.$create_invoice_request['data']['permanent_token'].'",'
+                                .'"'.$create_invoice_request['data']['url'].'"'
+                                .');';
+                        }
 
-            return;
+                        Db::getInstance()->execute($query);
+                            
+                        $this->writeLog("INFO - Fattura creata: #" . $number_to_save);
+                        
+                        if (Configuration::get('FATTUREINCLOUD_INVOICES_SEND_TO_SDI')) {
+                            $this->writeLog("DEBUG - Invio fattura elettronica abilitato, procedo con verifica XML");
+                            $verify_einvoice_request = $fic_client->verifyEInvoiceXML($create_invoice_request['data']['id']);
+                            
+                            if (isset($verify_einvoice_request["error"])) {
+                                $this->writeLog("ERROR - Verifica XML fallita: " . json_encode($verify_einvoice_request));
+                            } else {
+                                $send_einvoice_request = $fic_client->sendEInvoice($create_invoice_request['data']['id']);
+                                
+                                if (isset($send_einvoice_request["error"])) {
+                                    $this->writeLog("ERROR - Invio fattura elettronica fallito: " . json_encode($send_einvoice_request));
+                                } else {
+                                    $this->writeLog("INFO - Fattura elettronica inviata con successo");
+                                }
+                            }
+                        }
+                        
+                        // Commit della transazione
+                        Db::getInstance()->commit();
+                        $this->writeLog("DEBUG - Commit transazione completato per fattura #" . $number_to_save);
+                    }
+                    
+                } else {
+                    
+                    $this->writeLog("INFO - Creazione fattura interrotta: Già esiste una fattura per questo ordine");
+                    Db::getInstance()->commit();
+                    $this->writeLog("DEBUG - Commit transazione dopo controllo duplicato fattura");
+                    
+                }
+
+                return;
+                
+            } catch (Exception $e) {
+                // Rollback in caso di errore
+                Db::getInstance()->rollback();
+                $this->writeLog("ERROR - Transazione fallita per creazione fattura: " . $e->getMessage());
+                $this->writeLog("DEBUG - Rollback transazione per eccezione: " . $e->getTraceAsString());
+                return;
+            }
         }
 
         if ($should_create_receipt) {
             $this->writeLog("INFO - Creazione Corrispettivo: " . $order_id);
+            $this->writeLog("DEBUG - Inizio transazione per corrispettivo, ordine ID: " . $order_id);
 
             $fic_client = $this->initFattureInCloudClient();
 
-            // Check if receipt already exists
-            $sql_receipt_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_receipt_id IS NOT NULL';
+            // Inizia transazione atomica
+            Db::getInstance()->beginTransaction();
+            
+            try {
+                // Check if receipt already exists (con lock per prevenire race conditions)
+                $sql_receipt_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_receipt_id IS NOT NULL FOR UPDATE';
 
-            if (Db::getInstance()->getRow($sql_receipt_check)) {
-                $this->writeLog("INFO - Creazione corrispettivo interrotta: Già esiste un corrispettivo per questo ordine: " . json_encode($get_receipt_detail_request));
+                if (Db::getInstance()->getRow($sql_receipt_check)) {
+                    $this->writeLog("INFO - Creazione corrispettivo interrotta: Già esiste un corrispettivo per questo ordine");
+                    $this->writeLog("DEBUG - Commit transazione dopo controllo duplicato");
+                    Db::getInstance()->commit();
+                    return;
+                }
+                
+                // Also check if invoice exists - if invoice exists, don't create receipt
+                $sql_invoice_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_invoice_id IS NOT NULL';
+                if (Db::getInstance()->getRow($sql_invoice_check)) {
+                    $this->writeLog("INFO - Non creo corrispettivo perché esiste già una fattura per questo ordine");
+                    $this->writeLog("DEBUG - Commit transazione dopo controllo fattura esistente");
+                    Db::getInstance()->commit();
+                    return;
+                }
+
+                $receipt_to_create = $this->mapPrestashopToFicReceipt($order_id, $create_receipt_on_shipped);
+                
+                // DEBUG: Log della struttura del corrispettivo
+                $this->writeLog("DEBUG - Struttura corrispettivo: " . json_encode($receipt_to_create));
+                
+                $create_receipt_request = $fic_client->createReceipt($receipt_to_create);
+
+                if (!$create_receipt_request || isset($create_receipt_request['error'])) {
+                    $this->writeLog("ERROR - Corrispettivo non creato: " . json_encode($create_receipt_request) . " - " . $fic_client->toJson() . " - " . json_encode($receipt_to_create));
+                    Db::getInstance()->rollback();
+                    return;
+                }
+                
+                // DEBUG: Log della risposta
+                $this->writeLog("DEBUG - Risposta creazione corrispettivo: " . json_encode($create_receipt_request));
+
+                $number_to_save = $create_receipt_request['data']['number'];
+                if (isset($create_receipt_request['data']['numeration']) && $create_receipt_request['data']['numeration'] != "") {
+                    $number_to_save .= $create_receipt_request['data']['numeration'];
+                }
+
+                if (isset($create_receipt_request['data']['year'])) {
+                    $number_to_save .= "/" . $create_receipt_request['data']['year'];
+                }
+
+                $receipt_url = null;
+                $receipt_token = null;
+                if (isset($create_receipt_request['data']['url'])) {
+                    $receipt_url = $create_receipt_request['data']['url'];
+                }
+                if (isset($create_receipt_request['data']['permanent_token'])) {
+                    $receipt_token = $create_receipt_request['data']['permanent_token'];
+                }
+
+                // Update existing row for this order if present, otherwise insert
+                $sql_row_check = 'SELECT id_fattureInCloud FROM `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' FOR UPDATE';
+                $row_check = Db::getInstance()->getRow($sql_row_check);
+                if (!empty($row_check['id_fattureInCloud'])) {
+                    $query = 'UPDATE `'._DB_PREFIX_.'fattureInCloud` SET '
+                        .' `fic_receipt_id` = '.$create_receipt_request['data']['id'].','
+                        .' `fic_receipt_number` = "'.$number_to_save.'",'
+                        .' `fic_receipt_download_token` = "'.$receipt_token.'",'
+                        .' `fic_receipt_download_url` = "'.$receipt_url.'"'
+                        .' WHERE `ps_order_id` = '.$order_id.';';
+                } else {
+                    $query = 'INSERT INTO `'._DB_PREFIX_.'fattureInCloud`
+                        (`ps_order_id`,`fic_receipt_id`,`fic_receipt_number`,`fic_receipt_download_token`,`fic_receipt_download_url`)
+                        VALUES (
+                        '.$order_id.',
+                        '.$create_receipt_request['data']['id'].',
+                        "'.$number_to_save.'",
+                        "'.$receipt_token.'",
+                        "'.$receipt_url.'"
+                    );';
+                }
+
+                Db::getInstance()->execute($query);
+                
+                // Commit della transazione
+                Db::getInstance()->commit();
+                
+                $this->writeLog("INFO - Corrispettivo creato: #" . $number_to_save);
+                
+            } catch (Exception $e) {
+                // Rollback in caso di errore
+                Db::getInstance()->rollback();
+                $this->writeLog("ERROR - Transazione fallita per creazione corrispettivo: " . $e->getMessage());
                 return;
             }
-            
-            // Also check if invoice exists - if invoice exists, don't create receipt
-            $sql_invoice_check = 'SELECT * FROM  `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.' AND fic_invoice_id IS NOT NULL';
-            if (Db::getInstance()->getRow($sql_invoice_check)) {
-                $this->writeLog("INFO - Non creo corrispettivo perché esiste già una fattura per questo ordine");
-                return;
-            }
-
-            $receipt_to_create = $this->composeReceipt($order_id);
-            
-            // DEBUG: Log della struttura del corrispettivo
-            $this->writeLog("DEBUG - Struttura corrispettivo: " . json_encode($receipt_to_create));
-            
-            $create_receipt_request = $fic_client->createReceipt($receipt_to_create);
-
-            if (!$create_receipt_request || isset($create_receipt_request['error'])) {
-                $this->writeLog("ERROR - Corrispettivo non creato: " . json_encode($create_receipt_request) . " - " . $fic_client->toJson() . " - " . json_encode($receipt_to_create));
-                return;
-            }
-            
-            // DEBUG: Log della risposta
-            $this->writeLog("DEBUG - Risposta creazione corrispettivo: " . json_encode($create_receipt_request));
-
-            $number_to_save = $create_receipt_request['data']['number'];
-            if (isset($create_receipt_request['data']['numeration']) && $create_receipt_request['data']['numeration'] != "") {
-                $number_to_save .= $create_receipt_request['data']['numeration'];
-            }
-
-            if (isset($create_receipt_request['data']['year'])) {
-                $number_to_save .= "/" . $create_receipt_request['data']['year'];
-            }
-
-            $receipt_url = null;
-            $receipt_token = null;
-            if (isset($create_receipt_request['data']['url'])) {
-                $receipt_url = $create_receipt_request['data']['url'];
-            }
-            if (isset($create_receipt_request['data']['permanent_token'])) {
-                $receipt_token = $create_receipt_request['data']['permanent_token'];
-            }
-
-            // Update existing row for this order if present, otherwise insert
-            $sql_row_check = 'SELECT id_fattureInCloud FROM `'._DB_PREFIX_.'fattureInCloud` WHERE `ps_order_id` = '.$order_id.';';
-            $row_check = Db::getInstance()->getRow($sql_row_check);
-            if (!empty($row_check['id_fattureInCloud'])) {
-                $query = 'UPDATE `'._DB_PREFIX_.'fattureInCloud` SET '
-                    .' `fic_receipt_id` = '.$create_receipt_request['data']['id'].','
-                    .' `fic_receipt_number` = "'.$number_to_save.'",'
-                    .' `fic_receipt_download_token` = "'.$receipt_token.'",'
-                    .' `fic_receipt_download_url` = "'.$receipt_url.'"'
-                    .' WHERE `ps_order_id` = '.$order_id.';';
-            } else {
-                $query = 'INSERT INTO `'._DB_PREFIX_.'fattureInCloud`
-                    (`ps_order_id`,`fic_receipt_id`,`fic_receipt_number`,`fic_receipt_download_token`,`fic_receipt_download_url`)
-                    VALUES (
-                    '.$order_id.',
-                    '.$create_receipt_request['data']['id'].',
-                    "'.$number_to_save.'",
-                    "'.$receipt_token.'",
-                    "'.$receipt_url.'"
-                );';
-            }
-
-            Db::getInstance()->execute($query);
-            $this->writeLog("INFO - Corrispettivo creato: #" . $number_to_save);
         }
-    }
-
-    /**
-     * Prepare receipt for creation
-     */
-    public function composeReceipt($order_id)
-    {
-        return $this->mapPrestashopToFicReceipt($order_id);
     }
 
     /**
@@ -1125,8 +1165,6 @@ class fattureincloud extends Module
             }
         }
 
-        // 2) fallback: order invoice date (may be empty)
-        $order = new Order((int) $order_id);
         if (!empty($order->invoice_date) && $order->invoice_date != '0000-00-00 00:00:00') {
             return $order->invoice_date;
         }
@@ -1165,11 +1203,15 @@ class fattureincloud extends Module
     /**
      * Map Prestashop order to FattureInCloud Receipt (corrispettivo)
      */
-    public function mapPrestashopToFicReceipt($order_id)
+    public function mapPrestashopToFicReceipt($order_id, $create_receipt_on_shipped = false)
     {
         $order = new Order((int) $order_id);
 
-        $paid_date = $this->getOrderPaidDate($order_id);
+        if ($create_receipt_on_shipped) {
+            $paid_date = date('Y-m-d H:i:s'); // Use current date for receipt if created on shipped status
+        } else {
+            $paid_date = $this->getOrderPaidDate($order_id);
+        }
         $receipt_date = date('Y-m-d', strtotime($paid_date));
 
         $numeration = Configuration::get('FATTUREINCLOUD_RECEIPTS_NUMERATION');
