@@ -1024,6 +1024,18 @@ class fattureincloud extends Module
             $this->writeLog("INFO - Creazione Corrispettivo per ordine ID: " . $order_id);
             $this->writeLog("DEBUG - Timestamp: " . date('Y-m-d H:i:s'));
 
+            $receipt_lock_name = 'fic_receipt_' . (int)$order_id;
+            $receipt_lock_acquired = (int) Db::getInstance()->getValue(
+                'SELECT GET_LOCK("' . pSQL($receipt_lock_name) . '", 5)'
+            );
+
+            if ($receipt_lock_acquired !== 1) {
+                $this->writeLog("ERROR - Creazione corrispettivo interrotta: lock non acquisito per ordine " . $order_id);
+                $this->writeLog("INFO - ========== FINE CREAZIONE CORRISPETTIVO (LOCK NON ACQUISITO) ==========");
+                return;
+            }
+
+            try {
             $fic_client = $this->initFattureInCloudClient();
 
             // Check if receipt already exists - LOG DETTAGLIATO
@@ -1126,6 +1138,11 @@ class fattureincloud extends Module
             $this->writeLog("INFO - Corrispettivo creato con successo: #" . $number_to_save);
             $this->writeLog("INFO - ID FattureInCloud: " . $create_receipt_request['data']['id']);
             $this->writeLog("INFO - ========== FINE CREAZIONE CORRISPETTIVO (SUCCESSO) ==========");
+            } finally {
+                Db::getInstance()->getValue(
+                    'SELECT RELEASE_LOCK("' . pSQL($receipt_lock_name) . '")'
+                );
+            }
         }
     }
 
